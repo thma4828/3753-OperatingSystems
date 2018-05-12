@@ -1,0 +1,17 @@
+user@cu-cs-vm:~/3753/PA3$ gcc -pthread -o mlookup multi-lookup.c
+multi-lookup.c:19:19: error: expected ‘;’, ‘,’ or ‘)’ before ‘char’
+ int main(int argc char**argv){
+                   ^
+multi-lookup.c: In function ‘producer’:
+multi-lookup.c:102:34: error: dereferencing pointer to incomplete type ‘struct pool’
+   pthread_mutex_lock(&thread_pool->global_mutex); //lock global mutex
+                                  ^
+multi-lookup.c: In function ‘consumer’:
+multi-lookup.c:165:22: warning: initialization from incompatible pointer type [-Wincompatible-pointer-types]
+  pool *thread_pool = (struct pool *)param; //ptr to thread pool
+                      ^
+multi-lookup.c:195:40: error: ‘addr_primary’ undeclared (first use in this function)
+    size_t br1 = fwrite(addr, 1, sizeof(addr_primary), results_txt); //write to 
+                                        ^
+multi-lookup.c:195:40: note: each undeclared identifier is reported only once for each function it appears in
+user@cu-cs-vm:~/3753/PA3$ 

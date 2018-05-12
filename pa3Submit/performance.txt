@@ -1,0 +1,13 @@
+1)1,1: performance: 35421 (over 4 trials)
+2)1,3: perforamnce: 31301(over 4 trials)
+3)3,3: performance: 41000 (over 4 trials)
+4)3,1: performance: 46500 (over 4 trials)
+5)3,5: performance: 57500 (over 4 trials)
+6)5,5: performance: 46000(over 4 trials)
+7)8,5: performance: 25779 (over 4 trials)
+
+My trials were and are rather wide in variation over the mean, and unfortunately I was unable to get the python script to work
+even though on every run that I run my program from the command line, it works with no deadlock!!
+
+My analysis is that due to my synchronization scheme, the performance is best when there are alot of producers and not as many consumers in ratio, or at least when there are <= the number of consumers as producers. Interestingly, the case with only 1 producer and 1 consumer was rather fast, and I would attribute this to the fact that the overhead of synchronizing a lot of threads is probably rather high with my synch scheme. I would also attribute the variability to a number of print statements that I have in for debugging. 
+

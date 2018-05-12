@@ -1,0 +1,9 @@
+PA4: thma4828@colorado.edu
+
+Simple say make all to compile my code....
+tests using default tests given in assignment. 
+
+I was able to implement a slow LRU, and I had trouble with implementing a predictive pager. 
+
+LRU and predictive pager are basically the same file, as I said was having trouble with using any sort of predictive paging that helped to speed
+up the program at at all. 
