@@ -1,257 +1,292 @@
 #include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
-
-#include "multi-lookup.h"
-#include "util.h"
-#include "util.c"
-
 #include <fcntl.h>
-#include <signal.h>
-#include <sys/types.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
 #include <sys/socket.h>
-#include <sys/wait.h>
-#include <sys/stat.h> 
-#include <sys/time.h>
-#include <errno.h>
 #include <netdb.h>
+#include <errno.h>
+#include <string.h>
+#include <ctype.h>
+#include <sys/time.h>
+#include <time.h>
 
-struct addr_info;
-struct pool;
-int dnslookup(const char*, char*, int); 
+#define ERROR1 99
+#define port 8000
 
-int main(int argc, char**argv){
-	if(argc < 6){
-		printf("usage: <#prod> <#cons> <req log> <res log> [<data files>]\n");
-		exit(-1);
-	}
-	//start program timer
-	struct timeval timer_init;
-	struct timeval timer_final;
-	gettimeofday(&timer_init, NULL);
+#define READ_MODE "r"
+#define WRITE_MODE "w"
+#define BOUND 15
+#define MAX_CONS 3
+#define MAX_PROD 3
 
-	//initialize pool struct in global area of program = main stack. 
-	struct pool ThreadPool;
-	ThreadPool.num_prod = atoi(argv[1]);
-	ThreadPool.num_cons = atoi(argv[2]);
+#define MAX_ALLOCS 1000
+#define MAXLINELENGTH 50
 
-	ThreadPool.file_count = 0;
+FILE *results_txt;
+FILE *serviced_txt;
+//list of blocked consumers/producers
+pthread_t blocked_consumers[MAX_CONS] = {0};
+pthread_t blocked_producers[MAX_PROD] = {0};
 
-    ThreadPool.output_files[0] = fopen(argv[4], "a"); //open  results.txt in append mode. 
-    ThreadPool.output_files[1] = fopen(argv[3], "a"); //open serviced.txt ^^
+//mutex locks
+pthread_mutex_t mutex_sh = PTHREAD_MUTEX_INITIALIZER;
+pthread_mutex_t consumer_write = PTHREAD_MUTEX_INITIALIZER;
+pthread_mutex_t producer_write = PTHREAD_MUTEX_INITIALIZER;
 
-    int M = 5;
-    while(argv[M] != NULL){ //while there are still files to be passed in, pass those files into our files array, 
-    	ThreadPool.files[M-5] = argv[M];
-    	M++;
-    	if(M-5 >= MAXFILES){ //no more than maxfiles files allowed.
-    		break;
-    	}
+//more global vars for thread manageament. 
+int producers_done = 0;
+int consumers_done = 0;
+int buffer_full = 0;
+int prod_done_count = 0;
+char *shared_buffer[BOUND];
+unsigned int in = 0;
+unsigned int out = BOUND-1;
+unsigned int shb_count = 0;
+
+//function pointers
+void *producer();
+void *consumer();
+
+//Heap Memory Tracker
+typedef struct{ //track all pointers I assign to the heap so that I dont memory leak. 
+    char *char_addr_on_heap[MAX_ALLOCS];
+    pthread_t *pt_addr_on_heap[MAX_ALLOCS];
+    int cc;
+    int cp;
+}heap_address_tracker;
+
+
+//heap address tracker instance for memory management. 
+pthread_mutex_t hatm = PTHREAD_MUTEX_INITIALIZER;
+heap_address_tracker HAT = {
+    .cc = 0,
+    .cp = 0,
+};
+
+pthread_mutex_t blocked_manage = PTHREAD_MUTEX_INITIALIZER;
+pthread_cond_t consumer_condition = PTHREAD_COND_INITIALIZER;
+pthread_cond_t producer_condition = PTHREAD_COND_INITIALIZER;
+
+int num_prod, num_cons;
+
+
+int main(int argc, char **argv){
+    //start program timer
+    clock_t time_1, time_2;
+    time_1 = clock();
+    //creating a thread pool for producers
+    if(argc < 6){
+        printf("usage: <#prod> <#cons> <req log> <res log> [<data files>]\n");
+        exit(-1);
     }
-    M = M - 5; //M = number of files. 
+ 	//read in number of producers and consumers from the command line   
+    num_prod = atoi(argv[1]);
+    num_cons = atoi(argv[2]);
+    //create producer pthread_t array
+    pthread_t prod_tid[10];
+    //open the relevant files, results is for resolver threads, serviced is for consumer threads
+    results_txt = fopen(argv[4], "a");
+    serviced_txt = fopen(argv[3], "a");
+    //if either files isn't open for logging, quit on -1
+    if(!results_txt || !serviced_txt){
+    	printf("files not open for logging\n");
+    	exit(-1);
+    }
+    //allocate a dynamic array of file pointers to the heap
+    char **files = malloc(8 * 5);
 
-    ThreadPool.num_files = M;
-    printf("number of files = %d\n", M);
+    int inc, z;
+    inc = 0;
+    z= 5;
 
-	
-	pthread_mutex_init(&ThreadPool.global_mutex, NULL);
-	
-	pthread_mutex_init(&ThreadPool.cons_write_lock, NULL);
-	
-	pthread_mutex_init(&ThreadPool.prod_write_lock, NULL);
-	
-	pthread_cond_init(&ThreadPool.consumer_block, NULL);
-	
-	pthread_cond_init(&ThreadPool.producer_block, NULL);
+    while(argv[z] && (inc < 5)){
+        files[inc] = argv[z];
+        inc++;
+        z++;
+    }
+    int num_files = inc + 1;
 
-	ThreadPool.buffer_counter = 0; //intially buffer is empty
-	ThreadPool.index = 0; //start at 0th index of buffer
+    if(num_files < num_prod) //then set:
+        num_prod = num_files; //1 producer per file. 
 
-	ThreadPool.is_writer_prod = 0; //initially no writer present 
-	ThreadPool.is_writer_cons = 0; //^^^
-
-	ThreadPool.producers_busy = 1; //intially both producers and consumers are working
-	ThreadPool.consumers_busy = 1; //^^^
-
-    for(int j=0; j<M; j++){
-    	ThreadPool.open_files[j] = fopen(ThreadPool.files[j], "r");
-    	if(ThreadPool.open_files[j] == NULL){
-    		printf("at least 1 file failed to open\n --> exiting with code 13\n");
-    		exit(13);
-    	}
-    	ThreadPool.files_done[j] = 0; //initially no files are done. 
+    for(int i=0; i<num_prod; i++){
+        prod_tid[i] = i;
+        pthread_create(&prod_tid[i], NULL, producer, files[i]);
+        printf("%d\n", i);
     }
 
-    for(int i=0; i<ThreadPool.num_prod; i++){ //CREATING PRODUCER THREADS
-    	ThreadPool.prod_ids[i] = i;
-    	pthread_create(&ThreadPool.prod_ids[i], NULL, producer, &ThreadPool);
+    printf("producer threads created\n");
+    //creating a thread pool for consumers
+    pthread_t con_tid[10];
+    
+    for(int i=0; i<num_cons; i++){
+        con_tid[i] = i;
+        pthread_create(&con_tid[i], NULL, consumer, NULL);
+        printf("%d\n", i);
+    }
+    printf("consumer threads created\n");
+
+
+    //waiting for threads to complete
+   
+    for(int j=0; j<num_prod; j++){
+        pthread_join(prod_tid[j], NULL);
+    }
+    printf("producer threads joined\n");
+    pthread_cond_broadcast(&consumer_condition);
+    producers_done = 1;
+     for(int j=0; j<num_cons; j++){
+        pthread_join(con_tid[j], NULL);
     }
 
-    for(int k=0; k<ThreadPool.num_cons; k++){ //CREATING CONSUMER THREADS
-    	ThreadPool.cons_ids[k] = k;
-    	pthread_create(&ThreadPool.cons_ids[k], NULL, consumer, &ThreadPool);
-    }
+    printf("consumer threads joined\n");
 
-    for(int j=0; j<ThreadPool.num_prod; j++){ //JOINING PRODUCER THREADS
-    	pthread_join(ThreadPool.prod_ids[j], NULL);
+    printf("--freeing all memory that has been allocated to the heap:--\n");
+    for(int h=0; h<HAT.cc; h++){
+        free((void *)HAT.char_addr_on_heap[h]);
     }
+    for(int w=0; w<HAT.cp; w++){
+        free((void *)HAT.pt_addr_on_heap[w]);
+    }
+    printf("----\nmemory deallocated succesffully\n");
 
-    for(int j=0; j<ThreadPool.num_cons; j++){ //JOINING CONSUMER THREADS
-    	pthread_join(ThreadPool.cons_ids[j], NULL);
-    }
-    gettimeofday(&timer_final, NULL); //end program timer
-    double time_difference = timer_final.tv_sec - timer_init.tv_sec; //calculate the difference
-    printf("====== Elapsed time for total execution: %lf ======\n", time_difference); //print to STDOUT
+    time_2 = clock();
+    double time_total = difftime(time_2, time_1);
+    printf("====== Elapsed time for total execution: %lf ======\n", time_total); //print to STDOUT
+
     return 0;
 }
 
-void *producer(void *param){
-	unsigned int tid = (unsigned int)pthread_self();
-	printf("[PRODUCER [%u]]: init\n", tid);
-	struct pool *thread_pool = (struct pool *)param; //get pointer to thread pool struct in main. 
-	int fc = 0; //files served = 0;
-	while(1){ //outer loop
-		//crit section 1
-		int lines_read = 0;
-		pthread_mutex_lock(&thread_pool->global_mutex); //lock global mutex
-		int K = 0;
-		printf("[PRODUCER [%u]]: selecting a file\n", tid);
-		printf("%d == num_files: ",thread_pool->num_files);
-		while(K < thread_pool->num_files){
-			if(thread_pool->files_done[K] == 1){
-				K++;
-				printf("k === %d: \n", K);
-			}else{
-				break;
-			}
-		}
-		printf("k: %d", K);
-		if(K >= thread_pool->num_files){
-			thread_pool->producers_busy = 0;
-			pthread_mutex_unlock(&thread_pool->global_mutex); //give up global mutex. 
-			break; //producers are done! break out of the loop
-		}
-		FILE *pfile = thread_pool->open_files[K]; //get pointer to particular file K that is not done
-		thread_pool->file_count = (thread_pool->file_count + 1) % MAXFILES;
-		int which_file = thread_pool->file_count;
-		pthread_mutex_unlock(&thread_pool->global_mutex); //unlock global mutex
-		//end of crit section 1
 
-		if(pfile == NULL){
-			printf("file not open\n");
-		}else{
-			char *p;
-			char f_line[LINE_LEN];
-			
-			while((p = fgets(f_line, LINE_LEN, pfile)) != NULL){
-				//crit section 2: accessing the heap with malloc, then adding to the buffer
-				
-				int i=0; 
-				while((i < LINE_LEN) && (p[i] != '\n')){ //determine actual length of string
-					i++;
-				}
-				pthread_mutex_lock(&thread_pool->global_mutex); //lock global mutex
-				char *hostname = malloc(i); //malloc a spot in the heap
-				for(int z=0; z<i; z++){
-					hostname[z] = p[z]; //allocate the name to the heap. 
-				}
-				printf("[PRODUCER [%u]]:	 hostname =%s.\n",tid, hostname);
-				if(thread_pool->buffer_counter >= BUFFERSIZE){ //if buffer is full
-					printf("[PRODUCER [%u]]:	buffer full\n",tid);
-					pthread_mutex_unlock(&thread_pool->global_mutex); //give up mutex
-					pthread_cond_signal(&thread_pool->consumer_block); //wakeup 1 consumer that is blocked on consumer block condition.
-					printf("[PRODUCER [%u]]:	signal success\n",tid); 
-					pthread_cond_wait(&thread_pool->producer_block, &thread_pool->global_mutex); // block producer thread
-				} //note that after getting through this statement a producer will have the global mutex! 
-				//bounded buffer problem crit section 3: already protected by global mutex
-				printf("[PRODUCER [%u]]:	entering critical section\n", tid);
-				thread_pool->buffer[thread_pool->index] = hostname;
-				thread_pool->index = (thread_pool->index + 1) % BUFFERSIZE;
-				thread_pool->buffer_counter = thread_pool->buffer_counter + 1;
-				pthread_mutex_unlock(&thread_pool->global_mutex); //give up mutex claim on resources. 
-				pthread_cond_signal(&thread_pool->consumer_block); //wakeup one consumer who is blocked on the buffer. 
-				//end of producers bounded buffer sequence. 
-				lines_read++;
-			}
-			
-		}
-		thread_pool->files_done[which_file] = 1;
-		if(lines_read)
-			fc++; //increment files serviced counter
 
-	}
-	//crit section 4
-	pthread_mutex_lock(&thread_pool->prod_write_lock); //we gain access to producer writer mutex. 
-	FILE *serviced_txt = thread_pool->output_files[1]; //serviced.txt pointer
-	char *msg = "Thread serviced #files = \n"; //my message
-	size_t bw1 = fwrite(msg, 1, strlen(msg), serviced_txt); //write to the file. 
-	size_t bw2 = fwrite(&fc, 4, 1, serviced_txt); //write to the file number of files serviced. 
-	pthread_mutex_unlock(&thread_pool->prod_write_lock); //end of critical section, release writer lock. */
-	pthread_exit(0); //exit
+void *producer(void *param){ //note that each thread should stay open to execute further files in real prog
+    
+    FILE* fo = fopen((const char *)param, READ_MODE);
+    
+    char f_line[MAXLINELENGTH];
+    
+    if(fo == NULL){
+        printf("[PROD]: file not open!\n");
+        pthread_exit(0);
+    }
+    char *p; 
+    int fc = 0;
+    while((p = fgets(f_line, MAXLINELENGTH, fo)) != NULL){
+        pthread_mutex_lock(&mutex_sh);
+        char *hostname = malloc(strlen(p));
+        HAT.char_addr_on_heap[HAT.cc] = hostname;
+        HAT.cc++;
+        pthread_mutex_unlock(&mutex_sh);
+        int i=0;
+        while((i < MAXLINELENGTH) && (p[i] != '\n')){
+            hostname[i] = p[i];
+            i++;
+        }
+        printf("%s\n", hostname);
+        pthread_mutex_lock(&mutex_sh);
+        if(shb_count >= BOUND){
+            printf("[PROD]: buffer full\n");
+            pthread_mutex_unlock(&mutex_sh); //give up resource lock
+            pthread_cond_signal(&consumer_condition); //wakeup consumers
+            pthread_cond_wait(&producer_condition, &mutex_sh); //wait for producer condition to be signaled. 
+        }
+        /**deadlock hazard, also should use semaphore for producers to block if a buffer full*/
+        //should be deadlocking on wait_s call
+        //wait_s(&S_shared_buff); //when this wait_S is called, it could be the case that the calling thread blocks with the mutex lock. 
+        shared_buffer[in] = hostname;
+        out = in;
+        in = (in + 1) % BOUND;
+        printf("[PROD]: added to buffer\n");
+        shb_count = shb_count + 1; 
+        pthread_mutex_unlock(&mutex_sh);
+        pthread_cond_signal(&consumer_condition);
+        
+
+
+    }
+    fc++;
+    pthread_mutex_lock(&mutex_sh);
+    //producer done
+    prod_done_count++;
+    pthread_mutex_unlock(&mutex_sh);
+
+    
+    //write to serviced. 
+    if(serviced_txt){
+        pthread_mutex_lock(&producer_write);
+        fprintf(serviced_txt, "Thread %lu serviced %d files\n", pthread_self(), fc);
+        pthread_mutex_unlock(&producer_write);
+    }else{
+        printf("failed to write to serviced.txt\n");
+    }
+
+    pthread_exit(0);
 }
 
-void *consumer(void *param){
-	unsigned int tid = (unsigned int)pthread_self();
-	printf("[CONSUMER [%u]]:	init\n", tid);
-	struct pool *thread_pool = (struct pool *)param; //ptr to thread pool
-	while(1){ //conusmer main loop
-		//critical section for consumers
-		pthread_mutex_lock(&thread_pool->global_mutex);
-		printf("[CONSUMER [%u]]:	entering critical section\n", tid);
-		if(thread_pool->buffer_counter <= 0){ //buffer empty
-			printf("[CONSUMER [%u]]:	buffer empty\n", tid);
-			if(!thread_pool->producers_busy){ //if producers done with the files. 
-				pthread_mutex_unlock(&thread_pool->global_mutex);  //give up mutex and break out of loop, program finished. 
-				printf("[CONSUMER [%u]]:	buffer empty AND producers done --> TERMINATING CONSUMER\n", tid);
-				break;
-			}
-			pthread_mutex_unlock(&thread_pool->global_mutex); //give up access to shared resources
-			pthread_cond_signal(&thread_pool->producer_block); //wakeup 1 producer that is blocked on the buffer. 
-			pthread_cond_wait(&thread_pool->consumer_block, &thread_pool->global_mutex); /*block on consumer condition and 
-																						when woken up will have access to global mutex*/
-		}
-		//we can now have access to the buffer! 
-		printf("[CONSUMER [%u]]:	getting item from buffer\n", tid);
-		char *hostn = thread_pool->buffer[(thread_pool->index - 1) % BUFFERSIZE]; //get address from the buffer
-		printf("[CONSUMER [%u]]:	decrementing index\n", tid);
-		thread_pool->index = (thread_pool->index - 1) % BUFFERSIZE;
-		thread_pool->buffer_counter = thread_pool->buffer_counter - 1;
-		pthread_mutex_unlock(&thread_pool->global_mutex); //give up access to shared resources. (no hold and wait)
-		pthread_cond_signal(&thread_pool->producer_block); //wakeup a producer who is blocked on producer condition
 
-		//resolve to IP address and write to results.txt. 
-		//crit section 2
-		
-		printf("[CONSUMER [%u]]: writing to file\n", tid);
-		pthread_mutex_lock(&thread_pool->cons_write_lock); // we want to write the resolved IP address to a file. 
-		FILE *results_txt = thread_pool->output_files[0]; //results.txt pointer
-		if(results_txt)
-			printf("[CONSUMER [%u]]: results_txt is non-null\n", tid);
-		if(hostn != NULL){
-			struct hostent *host_struct = gethostbyname(hostn);
-				if(host_struct == NULL){
-					printf("failed to resolve host name.\n");
-				}else{
-					char **addr_list = host_struct->h_addr_list;
-					if(addr_list == NULL){
-						printf("failed to resolve host name: %s \n", hostn);
-					}else{
-						if(addr_list[0]){
-							char *current_addr = addr_list[0]; //4 byte IP address. 
-							pthread_mutex_lock(&thread_pool->cons_write_lock); //get consumer write lock
-							fprintf(results_txt, "hostname: %s address:  %02x\n", hostn, *current_addr);
-							pthread_mutex_unlock(&thread_pool->cons_write_lock); //release the write lock. 
-						}else{
-							printf("failed to resolve host name: %s \n", hostn);
-						}
-					}
-				}
-				
-		}else{
-			printf("[CONSUMER [%u]]: item taken from buffer was NULL\n", tid);
-		}
-		pthread_mutex_unlock(&thread_pool->cons_write_lock); //give up writer mutex. 
+void *consumer(){
+	int loop = 1;
+    while(loop){
+            pthread_mutex_lock(&mutex_sh);
+            int ccount = shb_count;
+            if(ccount <= 0){ //if buffer empty
+                printf("buffer empty\n");
+                pthread_mutex_unlock(&mutex_sh); //release lock
+                if(producers_done){
+                    loop = 0;
+                }else{
+                	pthread_cond_signal(&producer_condition); //wakeup 1 producers, 
+                	pthread_cond_wait(&consumer_condition, &mutex_sh); //block on consumer condition
+                }
+                
+            }
+            //critical section //will either have mutex lock or have it from cond_wait
+            
+            char *tmp = shared_buffer[out];
+            shared_buffer[out] = NULL;
+            out = (out - 1) % BOUND;
+            //printf("critical section from consumers\n"); //write resolved hostname to file results.txt
+            if(tmp != NULL){
+                printf("[CONS]: resolving tmp = [%s] to IP address\n", tmp);
+                struct hostent *host_struct = gethostbyname(tmp);
+                if(!host_struct){
+                    printf("[CONS]: failed to resolve host name.\n");
+                }else{
+                    char **addr_list = host_struct->h_addr_list;
+                    if(addr_list == NULL){
+                        //printf("[CONS]: failed to resolve host name: %s \n", tmp);
+                    }else{
+                        if(addr_list[0]){
+                            char *current_addr = addr_list[0]; //4 byte IP address. 
+                            pthread_mutex_lock(&consumer_write); //get consumer write lock
+                            struct sockaddr_in Addr;
+                            
+                            Addr.sin_family = AF_INET;
+                            Addr.sin_addr.s_addr = *(unsigned long *)current_addr;
+                            
+                            
+                            printf("[CONS]: IP address: %s\n", inet_ntoa(Addr.sin_addr));
+                            fprintf(results_txt, "hostname: %s address:  %s\n", tmp, inet_ntoa(Addr.sin_addr));
+                            pthread_mutex_unlock(&consumer_write); //release the write lock. 
+                        }else{
+                            //printf("[CONS]: failed to resolve host name: %s \n", tmp);
+                        }
+                    }
+                }
+            }else{
+                //case where tries to get null pointer from the buffer for some reason. 
+                //shb_count++; <-- this should maybe be added? 
+            }
+            
+            in = out;
+            shb_count = shb_count - 1;
 
-	}
-	pthread_exit(0); //exit
+            pthread_mutex_unlock(&mutex_sh);
+            pthread_cond_signal(&producer_condition); 
+    }
+
+    pthread_exit(0);
 }
+
