@@ -70,9 +70,11 @@ pthread_cond_t consumer_condition = PTHREAD_COND_INITIALIZER;
 pthread_cond_t producer_condition = PTHREAD_COND_INITIALIZER;
 
 int num_prod, num_cons;
-
+int hosts_r, hosts_not_r;
 
 int main(int argc, char **argv){
+    // init globals
+    hosts_r = hosts_not_r = 0;
     //start program timer
     clock_t time_1, time_2;
     time_1 = clock();
@@ -155,7 +157,7 @@ int main(int argc, char **argv){
     time_2 = clock();
     double time_total = difftime(time_2, time_1);
     printf("====== Elapsed time for total execution: %lf ======\n", time_total); //print to STDOUT
-
+    printf("hosts resolved: %d\nhosts not resolved: %d\n", hosts_r, hosts_not_r);
     return 0;
 }
 
@@ -269,9 +271,11 @@ void *consumer(){
                             
                             printf("[CONS]: IP address: %s\n", inet_ntoa(Addr.sin_addr));
                             fprintf(results_txt, "hostname: %s address:  %s\n", tmp, inet_ntoa(Addr.sin_addr));
-                            pthread_mutex_unlock(&consumer_write); //release the write lock. 
+                            pthread_mutex_unlock(&consumer_write); //release the write lock.
+			    hosts_r++; 
                         }else{
                             //printf("[CONS]: failed to resolve host name: %s \n", tmp);
+			    hosts_not_r++;
                         }
                     }
                 }
